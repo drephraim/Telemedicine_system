@@ -68,17 +68,27 @@ function fillUserUI() {
 
 async function requireAuth(role = null) {
   try {
-    await getMe();
-    if (role && currentUser.role !== role) {
+    const me = await getMe();
+    if (!me) {
+      window.location.href = "/static/index.html";
+      return false;
+    }
+    const currentRole = String(me.role || "").toLowerCase();
+    const targetRole = role ? String(role).toLowerCase() : null;
+    if (targetRole && currentRole !== targetRole) {
       const map = { patient: "/static/patient-dashboard.html", doctor: "/static/doctor-dashboard.html", admin: "/static/admin-dashboard.html" };
-      window.location.href = map[currentUser.role] || "/static/index.html";
+      window.location.href = map[currentRole] || "/static/index.html";
       return false;
     }
     fillUserUI();
     return true;
   } catch (err) {
-    localStorage.removeItem(TOKEN_KEY);
-    window.location.href = "/static/index.html";
+    console.warn("Auth validation error:", err);
+    if (!token) {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem("telemed_token");
+      window.location.href = "/static/index.html";
+    }
     return false;
   }
 }
@@ -91,6 +101,17 @@ function switchSection(id) {
   qsa(`[data-section='${id}']`).forEach(s => s.classList.add("active"));
   localStorage.setItem("telemed_v2_section", id);
   if (window.innerWidth < 1050) $("sidebar")?.classList.remove("open");
+
+  const widget = $("globalChatbotWidget");
+  if (widget) {
+    if (id === "patient-chatbot") {
+      widget.style.display = "none";
+      const drawer = $("globalChatbotDrawer");
+      if (drawer) drawer.style.display = "none";
+    } else {
+      widget.style.display = "flex";
+    }
+  }
 }
 
 function wireNavigation(defaultSection) {
@@ -494,10 +515,93 @@ async function loadPendingDoctors() {
 async function approveDoctor(id) { await request(`/api/admin/doctors/${id}/approve`, { method: "PUT" }); await Promise.allSettled([loadPendingDoctors(), loadAdminDashboard()]); }
 async function rejectDoctor(id) { await request(`/api/admin/doctors/${id}/reject`, { method: "PUT" }); await Promise.allSettled([loadPendingDoctors(), loadAdminDashboard()]); }
 
+let adminUsersCache = {};
+
 async function loadAdminUsers() {
   const data = await request("/api/admin/users");
-  if ($("adminUsersTable")) $("adminUsersTable").innerHTML = rowTable(["Name", "Email", "Role", "Status", "Created"], data.map(u => `<tr><td>${escapeHtml(u.full_name)}</td><td>${escapeHtml(u.email)}</td><td>${badge(u.role)}</td><td>${badge(u.status)}</td><td>${formatDate(u.created_at)}</td></tr>`), "No users.");
+  adminUsersCache = {};
+  data.forEach(u => { adminUsersCache[u.id] = u; });
+
+  if ($("adminUsersTable")) {
+    $("adminUsersTable").innerHTML = rowTable(
+      ["Name", "Email", "Phone", "Role", "Password", "Status", "Created", "Action"],
+      data.map(u => `<tr>
+        <td><strong>${escapeHtml(u.full_name)}</strong></td>
+        <td>${escapeHtml(u.email)}</td>
+        <td>${escapeHtml(u.phone || "-")}</td>
+        <td>${badge(u.role)}</td>
+        <td><code style="background:var(--card-bg-alt,#f1f5f9);padding:2px 6px;border-radius:4px;font-family:monospace;font-size:0.85rem">${escapeHtml(u.password_plain || "••••••••")}</code></td>
+        <td>${badge(u.status)}</td>
+        <td>${formatDate(u.created_at)}</td>
+        <td>
+          <button class="btn btn-sm secondary" onclick="openEditUserModal('${u.id}')">
+            <span class="material-symbols-outlined" style="font-size:15px;vertical-align:-2px">edit</span> Edit
+          </button>
+        </td>
+      </tr>`),
+      "No users registered yet."
+    );
+  }
 }
+
+function openEditUserModal(userId) {
+  const u = adminUsersCache[userId];
+  if (!u) return;
+
+  $("editUserId").value = u.id;
+  $("editUserFullName").value = u.full_name || "";
+  $("editUserEmail").value = u.email || "";
+  $("editUserPhone").value = u.phone || "";
+  $("editUserRole").value = u.role || "patient";
+  $("editUserStatus").value = u.status || "active";
+  $("editUserNewPassword").value = "";
+
+  const alertBox = $("editUserAlert");
+  if (alertBox) alertBox.style.display = "none";
+
+  const modal = $("editUserModal");
+  if (modal) modal.style.display = "flex";
+}
+
+function closeEditUserModal() {
+  const modal = $("editUserModal");
+  if (modal) modal.style.display = "none";
+}
+
+async function adminSaveUser() {
+  try {
+    const userId = $("editUserId").value;
+    if (!userId) return;
+
+    const payload = {
+      full_name: $("editUserFullName").value.trim(),
+      email: $("editUserEmail").value.trim(),
+      phone: $("editUserPhone").value.trim(),
+      role: $("editUserRole").value,
+      status: $("editUserStatus").value,
+    };
+
+    const newPass = $("editUserNewPassword").value.trim();
+    if (newPass) {
+      if (newPass.length < 6) {
+        setAlert("editUserAlert", "New password must be at least 6 characters.", "error");
+        return;
+      }
+      payload.new_password = newPass;
+    }
+
+    await request(`/api/admin/users/${userId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    });
+
+    closeEditUserModal();
+    await Promise.allSettled([loadAdminUsers(), loadAdminDashboard(), loadAdminAuditLogs()]);
+  } catch (err) {
+    setAlert("editUserAlert", err.message, "error");
+  }
+}
+
 
 async function loadAdminPayments() {
   const data = await request("/api/admin/payments");
@@ -821,23 +925,307 @@ async function toggleGlobalTheme() {
 }
 
 let chatbotSessionId = null;
+let audioReadoutEnabled = true;
+
+function toggleAudioReadout() {
+  audioReadoutEnabled = !audioReadoutEnabled;
+  const btn = $("ttsToggleBtn");
+  if (btn) btn.innerHTML = audioReadoutEnabled ? '<span class="material-symbols-outlined" style="font-size:16px;vertical-align:-3px">volume_up</span> Voice: On' : '<span class="material-symbols-outlined" style="font-size:16px;vertical-align:-3px">volume_off</span> Voice: Off';
+}
+
+function readAloudText(text) {
+  if (!audioReadoutEnabled || !("speechSynthesis" in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    window.speechSynthesis.speak(utterance);
+  } catch (e) {
+    console.warn("Speech synthesis failed:", e);
+  }
+}
+
+function formatChatTime(dateStr) {
+  const d = dateStr ? new Date(dateStr) : new Date();
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatBotMessage(rawText) {
+  if (!rawText) return "";
+  
+  let safeText = escapeHtml(rawText);
+
+  // Bold text: **text** or __text__ -> <strong>text</strong>
+  safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  safeText = safeText.replace(/__(.*?)__/g, '<strong>$1</strong>');
+
+  // Split into lines to format lists and paragraphs
+  const lines = safeText.split(/\r?\n/);
+  let htmlOutput = "";
+  let inUnorderedList = false;
+  let inOrderedList = false;
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+
+    // Check bullet list item (•, -, *)
+    const bulletMatch = trimmed.match(/^([•\-\*])\s+(.+)$/);
+    // Check numbered list item (1., 2., 1), 2), etc.)
+    const numberMatch = trimmed.match(/^(\d+)[\.\)]\s+(.+)$/);
+
+    if (bulletMatch) {
+      if (inOrderedList) {
+        htmlOutput += "</ol>";
+        inOrderedList = false;
+      }
+      if (!inUnorderedList) {
+        htmlOutput += "<ul>";
+        inUnorderedList = true;
+      }
+      htmlOutput += `<li>${bulletMatch[2]}</li>`;
+    } else if (numberMatch) {
+      if (inUnorderedList) {
+        htmlOutput += "</ul>";
+        inUnorderedList = false;
+      }
+      if (!inOrderedList) {
+        htmlOutput += "<ol>";
+        inOrderedList = true;
+      }
+      htmlOutput += `<li>${numberMatch[2]}</li>`;
+    } else {
+      if (inUnorderedList) {
+        htmlOutput += "</ul>";
+        inUnorderedList = false;
+      }
+      if (inOrderedList) {
+        htmlOutput += "</ol>";
+        inOrderedList = false;
+      }
+
+      if (trimmed.length > 0) {
+        htmlOutput += `<p>${trimmed}</p>`;
+      }
+    }
+  });
+
+  if (inUnorderedList) htmlOutput += "</ul>";
+  if (inOrderedList) htmlOutput += "</ol>";
+
+  return htmlOutput || `<p>${safeText}</p>`;
+}
+
+function usePromptChip(text) {
+  const mainInput = $("chatbotInput");
+  const globalInput = $("globalChatbotInput");
+  if (mainInput) {
+    mainInput.value = text;
+    mainInput.focus();
+  }
+  if (globalInput) {
+    globalInput.value = text;
+    globalInput.focus();
+  }
+  sendChatbotMessage();
+}
+
+function toggleGlobalChatbot() {
+  const drawer = $("globalChatbotDrawer");
+  if (drawer) {
+    const isHidden = drawer.style.display === "none";
+    drawer.style.display = isHidden ? "flex" : "none";
+    if (isHidden && $("globalChatbotInput")) {
+      $("globalChatbotInput").focus();
+    }
+  }
+}
+
+async function resetChatbotSession() {
+  chatbotSessionId = null;
+  const thread = $("chatbotThread");
+  const globalThread = $("globalChatbotThread");
+  const welcomeHtml = `
+    <div class="chat-line bot">
+      <div class="chat-avatar bot-avatar"><span class="material-symbols-outlined">smart_toy</span></div>
+      <div class="chat-content">
+        <div class="chat-sender">ORIGEN AI Assistant <span class="chat-time">${formatChatTime()}</span></div>
+        <p>New session started. Describe your symptoms and I will provide clinical guidance and specialty recommendations.</p>
+        <div class="chat-disclaimer"><span class="material-symbols-outlined icon-inline" style="font-size:15px;vertical-align:-3px;color:var(--warning)">warning</span> Emergency symptoms should be handled immediately through urgent physical care.</div>
+      </div>
+    </div>`;
+  if (thread) thread.innerHTML = welcomeHtml;
+  if (globalThread) globalThread.innerHTML = welcomeHtml;
+}
+
+function filterDoctorSpecialty(specialty) {
+  if (specialty === "Emergency Care") {
+    alert("EMERGENCY NOTICE: If you are experiencing chest pain, severe shortness of breath, or heavy bleeding, please go directly to the nearest hospital emergency room.");
+    return;
+  }
+  switchSection("patient-doctors");
+  const searchInput = $("doctorSearchInput") || $("specialtySelect");
+  if (searchInput) {
+    searchInput.value = specialty;
+    if (typeof filterDoctors === "function") filterDoctors();
+  }
+}
+
 async function sendChatbotMessage() {
   try {
-    const input = $("chatbotInput");
-    const msg = input?.value.trim();
+    const mainInput = $("chatbotInput");
+    const globalInput = $("globalChatbotInput");
+    const msg = (mainInput?.value || globalInput?.value || "").trim();
     if (!msg) return;
+
+    if (mainInput) mainInput.value = "";
+    if (globalInput) globalInput.value = "";
+
+    const timeStr = formatChatTime();
+    const userHtml = `
+      <div class="chat-line patient">
+        <div class="chat-avatar patient-avatar"><span class="material-symbols-outlined">person</span></div>
+        <div class="chat-content">
+          <div class="chat-sender">You <span class="chat-time">${timeStr}</span></div>
+          <p>${escapeHtml(msg)}</p>
+        </div>
+      </div>`;
+
     const thread = $("chatbotThread");
-    if (thread) thread.innerHTML += `<div class="chat-line patient"><strong>You</strong><p>${escapeHtml(msg)}</p></div>`;
-    input.value = "";
-    const language = $("languageSelect")?.value || "en";
-    const res = await request("/api/chatbot/message", { method: "POST", body: JSON.stringify({ message: msg, session_id: chatbotSessionId, language }) });
-    chatbotSessionId = res.session_id;
+    const globalThread = $("globalChatbotThread");
+    const typing = $("chatbotTyping");
+    const globalTyping = $("globalChatbotTyping");
+
     if (thread) {
-      thread.innerHTML += `<div class="chat-line bot"><strong>ORIGEN AI</strong><p>${escapeHtml(res.reply)}</p><div>${badge(res.risk_level)} <span class="badge dark">${escapeHtml(res.recommended_specialty)}</span></div><small>${escapeHtml(res.disclaimer)}</small></div>`;
+      thread.innerHTML += userHtml;
       thread.scrollTop = thread.scrollHeight;
     }
+    if (globalThread) {
+      globalThread.innerHTML += userHtml;
+      globalThread.scrollTop = globalThread.scrollHeight;
+    }
+
+    if (typing) typing.style.display = "flex";
+    if (globalTyping) globalTyping.style.display = "flex";
+
+    const language = $("languageSelect")?.value || "en";
+    const res = await request("/api/chatbot/message", {
+      method: "POST",
+      body: JSON.stringify({ message: msg, session_id: chatbotSessionId, language })
+    });
+    chatbotSessionId = res.session_id;
+
+    if (typing) typing.style.display = "none";
+    if (globalTyping) globalTyping.style.display = "none";
+
+    const formattedReply = formatBotMessage(res.reply || "");
+    const riskClass = (res.risk_level || "low").toLowerCase();
+    const riskTag = `<span class="risk-tag ${riskClass}">${escapeHtml(res.risk_level || "Low")} Risk</span>`;
+    const specBtn = res.recommended_specialty && res.recommended_specialty !== "None"
+      ? `<button class="book-spec-btn" onclick="filterDoctorSpecialty('${escapeHtml(res.recommended_specialty)}')"><span class="material-symbols-outlined" style="font-size:16px">stethoscope</span> Book ${escapeHtml(res.recommended_specialty)} Doctor</button>`
+      : "";
+    const cleanSpeechText = (res.reply || "").replace(/'/g, "\\'").replace(/\r?\n/g, " ");
+    const speakBtn = `<button class="speak-reply-btn" onclick="readAloudText('${escapeHtml(cleanSpeechText)}')"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:-2px">volume_up</span> Read Aloud</button>`;
+    const disclaimerText = res.disclaimer || "AI chatbot guidance is not a final diagnosis. Emergency cases require immediate urgent care.";
+
+    const botHtml = `
+      <div class="chat-line bot">
+        <div class="chat-avatar bot-avatar"><span class="material-symbols-outlined">smart_toy</span></div>
+        <div class="chat-content">
+          <div class="chat-sender">ORIGEN AI Assistant <span class="chat-time">${formatChatTime()}</span></div>
+          ${formattedReply}
+          <div class="chat-meta-tags">
+            ${riskTag}
+            ${speakBtn}
+          </div>
+          ${specBtn}
+          <div class="chat-disclaimer"><span class="material-symbols-outlined icon-inline" style="font-size:14px;vertical-align:-2px;color:var(--warning)">warning</span> ${escapeHtml(disclaimerText)}</div>
+        </div>
+      </div>`;
+
+    if (thread) {
+      thread.innerHTML += botHtml;
+      thread.scrollTop = thread.scrollHeight;
+    }
+    if (globalThread) {
+      globalThread.innerHTML += botHtml;
+      globalThread.scrollTop = globalThread.scrollHeight;
+    }
+
+    readAloudText(res.reply);
     await Promise.allSettled([loadTimeline(), loadNotifications()]);
-  } catch (err) { setAlert("chatbotAlert", err.message, "error"); }
+  } catch (err) {
+    const typing = $("chatbotTyping");
+    const globalTyping = $("globalChatbotTyping");
+    if (typing) typing.style.display = "none";
+    if (globalTyping) globalTyping.style.display = "none";
+    setAlert("chatbotAlert", err.message, "error");
+  }
+}
+
+function sendGlobalChatbotMessage() {
+  sendChatbotMessage();
+}
+
+async function loadChatbotHistory() {
+  try {
+    const res = await request("/api/chatbot/history");
+    if (!res || !res.messages || res.messages.length === 0) return;
+    chatbotSessionId = res.session_id;
+
+    const thread = $("chatbotThread");
+    const globalThread = $("globalChatbotThread");
+    if (!thread && !globalThread) return;
+
+    let html = "";
+    res.messages.forEach(m => {
+      const timeStr = formatChatTime(m.created_at);
+      if (m.sender === "patient") {
+        html += `
+          <div class="chat-line patient">
+            <div class="chat-avatar patient-avatar"><span class="material-symbols-outlined">person</span></div>
+            <div class="chat-content">
+              <div class="chat-sender">You <span class="chat-time">${timeStr}</span></div>
+              <p>${escapeHtml(m.message)}</p>
+            </div>
+          </div>`;
+      } else {
+        const formattedMsg = formatBotMessage(m.message || "");
+        const riskClass = (m.risk_level || "low").toLowerCase();
+        const riskTag = m.risk_level ? `<span class="risk-tag ${riskClass}">${escapeHtml(m.risk_level)} Risk</span>` : "";
+        const specBtn = m.recommended_specialty && m.recommended_specialty !== "None"
+          ? `<button class="book-spec-btn" onclick="filterDoctorSpecialty('${escapeHtml(m.recommended_specialty)}')"><span class="material-symbols-outlined" style="font-size:16px">stethoscope</span> Book ${escapeHtml(m.recommended_specialty)} Doctor</button>`
+          : "";
+        const cleanSpeechText = (m.message || "").replace(/'/g, "\\'").replace(/\r?\n/g, " ");
+        const speakBtn = `<button class="speak-reply-btn" onclick="readAloudText('${escapeHtml(cleanSpeechText)}')"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:-2px">volume_up</span> Read Aloud</button>`;
+
+        html += `
+          <div class="chat-line bot">
+            <div class="chat-avatar bot-avatar"><span class="material-symbols-outlined">smart_toy</span></div>
+            <div class="chat-content">
+              <div class="chat-sender">ORIGEN AI Assistant <span class="chat-time">${timeStr}</span></div>
+              ${formattedMsg}
+              <div class="chat-meta-tags">
+                ${riskTag}
+                ${speakBtn}
+              </div>
+              ${specBtn}
+            </div>
+          </div>`;
+      }
+    });
+
+    if (thread) {
+      thread.innerHTML = html;
+      thread.scrollTop = thread.scrollHeight;
+    }
+    if (globalThread) {
+      globalThread.innerHTML = html;
+      globalThread.scrollTop = globalThread.scrollHeight;
+    }
+  } catch (err) {
+    console.warn("Could not load chatbot history:", err);
+  }
 }
 
 function speechToTextToInput(targetId) {
@@ -857,6 +1245,7 @@ function speechToTextToInput(targetId) {
   rec.onerror = (event) => setAlert("chatbotAlert", `Speech error: ${event.error}`, "error");
   rec.start();
 }
+
 
 async function loadTimeline() {
   try {
@@ -898,7 +1287,7 @@ patientInit = async function() {
   wireNavigation("patient-overview");
   await loadPreferences();
   if ($("appointmentDate")) $("appointmentDate").value = tomorrowDate();
-  await Promise.allSettled([loadPatientProfile(), loadDoctors(), loadScreenings(), loadAppointments(), loadPayments(), loadRecords(), loadPrescriptions(), loadNotifications(), loadTimeline()]);
+  await Promise.allSettled([loadPatientProfile(), loadDoctors(), loadScreenings(), loadAppointments(), loadPayments(), loadRecords(), loadPrescriptions(), loadNotifications(), loadTimeline(), loadChatbotHistory()]);
 };
 
 const _doctorInitOriginal = doctorInit;
